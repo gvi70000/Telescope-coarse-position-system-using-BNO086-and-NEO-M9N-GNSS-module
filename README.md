@@ -15,12 +15,4 @@ This device comes equipped also with 64kbyte SPI EEPROM to store user data.
 
 The KiCAD files can be downloaded here.
 
-The C library software for each IC:
-
-BNO086 9 axis IMU- Link
-
-BMP581 Temperature and pressure sensor- Link
-
-NEO-M9N GNSS Module- Link
-
-M95512 SPI EEPROM- Link
+The C library software for each IC are uploaded in this repository.
