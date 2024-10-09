@@ -79,7 +79,7 @@ extern "C" {
 // Delays
 #define RESET_DELAY											200
 #define PORT_TIMEOUT										500
-#define Q_FLIP													0.70710678118654752440084436210485
+#define Q_FLIP												0.70710678118654752440084436210485
 #define _180_DIV_PI											57.295779515f // = 180 / PI
 
 // Array sizes
@@ -334,6 +334,7 @@ typedef enum {
 } BNO_MotionIntent_t;
 
 // General structures
+
 typedef struct __attribute__((packed)) {
 	BNO_ResetCause_t	rst_Cause;	// report 0xF8 byte 1 Reset Cause
 	uint8_t						sw_Maj;			// report 0xF8 byte 2 SW Version Major
@@ -343,12 +344,12 @@ typedef struct __attribute__((packed)) {
 	uint16_t					sw_VP;			// report 0xF8 byte 12-13 SW Version Patch
 } BNO_productID_t;
 
-typedef struct __attribute__((packed)){
+typedef struct __attribute__((packed)) {
 	uint8_t status;
 	uint16_t wordOffset;
 } BNO_FrsWriteResp_t;
 
-typedef struct __attribute__((packed)){
+typedef struct __attribute__((packed)) {
 	uint8_t len_status;
 	uint16_t wordOffset;
 	uint32_t data0;
@@ -436,7 +437,7 @@ typedef struct __attribute__((packed)) {
 
 // Sensor values 
 
-typedef struct BNO_RollPitchYaw {
+typedef struct __attribute__((packed)) {
 	float Roll;
 	float Pitch;
 	float Yaw;
@@ -616,7 +617,7 @@ typedef enum {
 	PAC_RUNNING,
 } BNO_PAC_t;
 // Personal Activity Classifier
-typedef struct BNO_PersonalActivityClassifier {
+typedef struct __attribute__((packed)) {
 	uint8_t Page;
 	uint8_t LastPage;
 	BNO_PAC_t MostLikelyState;
@@ -626,7 +627,7 @@ typedef struct BNO_PersonalActivityClassifier {
 
 #ifdef GYRO_INTEGRATED_RV
 // Gyro Integrated Rotation Vector
-typedef struct BNO_GyroIntegratedRV {
+typedef struct __attribute__((packed)) {
 	float I;   // Quaternion component i
 	float J;   // Quaternion component j
 	float K;   // Quaternion component k
@@ -654,14 +655,14 @@ typedef enum {
 	IZRO_MR_STATIONARY_URGENT,
 } BNO_IZroMotionRequest_t;
 
-typedef struct BNO_IZroRequest {
+typedef struct __attribute__((packed)) {
 	BNO_IZroMotionIntent_t Intent;
 	BNO_IZroMotionRequest_t Request;
 } BNO_IZroRequest_t;
 #endif
 
 #ifdef RAW_OPTICAL_FLOW
-typedef struct BNO_RawOptFlow {
+typedef struct __attribute__((packed)) {
 	uint32_t TimeStamp;
 	int16_t Dt;
 	int16_t Dx;
@@ -678,7 +679,7 @@ typedef struct BNO_RawOptFlow {
 #endif
 
 #ifdef DEAD_RECKONING_POSE
-typedef struct BNO_DeadReckoningPose {
+typedef struct __attribute__((packed)) {
 	uint32_t TimeStamp;
 	float LinPosX;
 	float LinPosY;
@@ -697,7 +698,7 @@ typedef struct BNO_DeadReckoningPose {
 #endif
 
 #ifdef WHEEL_ENCODER
-typedef struct BNO_WheelEncoder {
+typedef struct __attribute__((packed)) {
 	uint32_t TimeStamp;
 	uint8_t WheelIndex;
 	uint8_t DataType;
@@ -705,7 +706,7 @@ typedef struct BNO_WheelEncoder {
 } BNO_WheelEncoder_t;
 #endif
 
-typedef struct BNO_SensorValue {
+typedef struct __attribute__((packed)) {
 	uint8_t sensorId; // Which sensor produced this event.
 	uint8_t sequence; // The sequence number increments once for each report sent. Gaps in the sequence numbers indicate missing or dropped reports.
 	uint8_t status; // bits 7-5: reserved, 4-2: exponent delay, 1-0: Accuracy 0 - Unreliable 1 - Accuracy low 2 - Accuracy medium 3 - Accuracy high
@@ -845,6 +846,7 @@ extern BNO_RollPitchYaw_t rpy;
 // If the pin is pulled low during reset or poweron, the BNO08X will enter the bootloader mode.
 // If the BOOTN pin is pulled high, then the bootloader starts the application
 HAL_StatusTypeDef BNO_Init(void);
+HAL_StatusTypeDef BNO_setHighAccuracyMode(void);
 // Check if we have unexpected reset
 uint8_t isResetOccurred(void);
 // Get the sensor that has new data

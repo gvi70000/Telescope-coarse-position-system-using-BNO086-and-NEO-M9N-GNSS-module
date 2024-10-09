@@ -10,7 +10,8 @@
 //Global Variables
 
 // The interrupt variable
-volatile uint8_t BNO_Ready = 0;
+extern volatile uint8_t BNO_Ready;
+//extern volatile uint8_t i2c1_transfer_complete;
 //A monotonically incrementing uint8_t that rolls over. It is used to detect missing commands and to synchronize responses
 static uint8_t commandSequenceNumber = 0;
 // Similar with  the above var
@@ -52,6 +53,7 @@ BNO_RollPitchYaw_t rpy = {0};
 
 BNO_SensorValue_t sensorData = {0};
 
+uint32_t counter;
 
 // Wait for an interrupt to occur or timeout in 200ms
 static uint8_t waitInt(void) {
@@ -96,41 +98,57 @@ static void delay_us(uint32_t t) {
 #ifdef USE_FOR_TELESCOPE
 // get 1/sqrt(x)
 static float invSqrt(const float x) {
-	float halfx = 0.5f * x;
-	float y = x;
-	long i = *(long*)&y;
-	i = 0x5f3759df - (i>>1);
-	y = *(float*)&i;
-	y = y * (1.5f - (halfx * y * y));
-	return y;
+    float halfx = 0.5f * x;
+    float y = x;
+    int i = *(int*)&y;  // Interpret float bits as integer
+    i = 0x5f3759df - (i >> 1);  // Magic number for fast approximation
+    y = *(float*)&i;
+    y = y * (1.5f - (halfx * y * y));  // Refine approximation
+    return y;
 }
 
 // Update structures quatIJKR and angles
 static void quaternionUpdate(const BNO_RotationVectorWAcc_t *inRotVector) {
-	double norm = invSqrt(inRotVector->I * inRotVector->I + inRotVector->J * inRotVector->J + inRotVector->K * inRotVector->K + inRotVector->Real * inRotVector->Real);    // normalize quaternion
-	
-	double q1 = inRotVector->I * norm; //x
-	double q2 = inRotVector->J * norm; //y
-	double q3 = inRotVector->K * norm; //z
-	double q4 = inRotVector->Real * norm; //w
+    // Normalize quaternion
+    float norm = invSqrt(inRotVector->I * inRotVector->I + 
+                         inRotVector->J * inRotVector->J + 
+                         inRotVector->K * inRotVector->K + 
+                         inRotVector->Real * inRotVector->Real);
 
-	rpy.Pitch = atan2f(2.0f * (q2*q3 + q1*q4), q1*q1 + q2*q2 - q3*q3 - q4*q4);
-	rpy.Roll  = -asinf(2.0f * (q2*q4 - q1*q3));
-	rpy.Yaw   = atan2f(2.0f * (q1*q2 + q3*q4), q1*q1 - q2*q2 - q3*q3 + q4*q4);
+    // Apply normalization to quaternion components
+    float q1 = inRotVector->I * norm;  // x
+    float q2 = inRotVector->J * norm;  // y
+    float q3 = inRotVector->K * norm;  // z
+    float q4 = inRotVector->Real * norm;  // w
 
-	rpy.Pitch *= _180_DIV_PI;
-	rpy.Roll  *= _180_DIV_PI;
-	rpy.Yaw   *= _180_DIV_PI;
-	
-	if(rpy.Yaw >= 0.0)
-		rpy.Yaw = 360.0 - rpy.Yaw;
-	else	
-		rpy.Yaw = -rpy.Yaw;
-	
-	if(rpy.Pitch >= 0.0)
-		rpy.Pitch = 180.0 - rpy.Pitch;
-	else
-		rpy.Pitch = -(rpy.Pitch + 180.f);
+    // Precompute repeated terms to save computation time
+    float q1q1 = q1 * q1;
+    float q2q2 = q2 * q2;
+    float q3q3 = q3 * q3;
+    float q4q4 = q4 * q4;
+
+    float q2q3 = q2 * q3;
+    float q1q4 = q1 * q4;
+    float q2q4 = q2 * q4;
+    float q1q3 = q1 * q3;
+    float q1q2 = q1 * q2;
+    float q3q4 = q3 * q4;
+
+    // Calculate roll, pitch, and yaw
+    rpy.Pitch = atan2f(2.0f * (q2q3 + q1q4), q1q1 + q2q2 - q3q3 - q4q4);
+    rpy.Roll  = -asinf(2.0f * (q2q4 - q1q3));
+    rpy.Yaw   = atan2f(2.0f * (q1q2 + q3q4), q1q1 - q2q2 - q3q3 + q4q4);
+
+    // Convert to degrees
+    rpy.Pitch *= _180_DIV_PI;
+    rpy.Roll  *= _180_DIV_PI;
+    rpy.Yaw   *= _180_DIV_PI;
+
+    // Normalize yaw to the [0, 360) range
+    rpy.Yaw = (rpy.Yaw >= 0.0f) ? 360.0f - rpy.Yaw : -rpy.Yaw;
+
+    // Normalize pitch to the [-180, 180] range
+    rpy.Pitch = (rpy.Pitch >= 0.0f) ? 180.0f - rpy.Pitch : -(rpy.Pitch + 180.0f);
 }
 #endif
 
@@ -141,69 +159,109 @@ static void resetHeader(const uint8_t id) {
 }
 
 // Send a packet data to BNO
+
 static HAL_StatusTypeDef sendPacket(const uint8_t channelNumber) {
-	// dataLength includes the SHTP_HEADER_SIZE
-	uint8_t dataLength = 0;
-	bufferIO[2] = channelNumber;
-	bufferIO[3] = sequenceNumber[channelNumber]++;
-	if(bufferIO[2] == CHANNEL_EXECUTABLE) {
-		dataLength = 5;
-	} else {
-		switch(bufferIO[4]) {
-			case REPORT_SENSOR_FLUSH_REQUEST:
-			case REPORT_GET_FEATURE_REQUEST:
-			case REPORT_PRODUCT_ID_REQUEST:
-				dataLength = 6;
-			break;			
-			case REPORT_FRS_READ_REQUEST:
-				dataLength = 12;
-			break;
-			case COMMAND_ME_CALIBRATE:
-			case COMMAND_TARE:
-			case COMMAND_SAVE_DCD:
-			case REPORT_COMMAND_REQUEST:
-			case REPORT_FRS_WRITE_REQUEST:
-				dataLength = 16;
-			break;
-			case REPORT_SET_FEATURE_COMMAND:
-				dataLength = 21;
-			break;
-		}
-	}
-	bufferIO[0] = dataLength & 0xFF;
-	bufferIO[1] = (dataLength >> 8) & 0x7F;
-	// Send packet to IMU
-	HAL_StatusTypeDef ret = HAL_I2C_Master_Transmit(&hi2c1, BNO_W_ADDR, bufferIO, dataLength, PORT_TIMEOUT);
-	delay_us(RESET_DELAY); // Delay 100 microsecs before next I2C
-	return ret;
+    // dataLength includes the SHTP_HEADER_SIZE
+    uint8_t dataLength = 0;
+    bufferIO[2] = channelNumber;
+    bufferIO[3] = sequenceNumber[channelNumber]++;
+    
+    // Determine the data length based on the channel type and command
+    if (bufferIO[2] == CHANNEL_EXECUTABLE) {
+        dataLength = 5;
+    } else {
+        switch (bufferIO[4]) {
+            case REPORT_SENSOR_FLUSH_REQUEST:
+            case REPORT_GET_FEATURE_REQUEST:
+            case REPORT_PRODUCT_ID_REQUEST:
+                dataLength = 6;
+                break;
+            case REPORT_FRS_READ_REQUEST:
+                dataLength = 12;
+                break;
+            case COMMAND_ME_CALIBRATE:
+            case COMMAND_TARE:
+            case COMMAND_SAVE_DCD:
+            case REPORT_COMMAND_REQUEST:
+            case REPORT_FRS_WRITE_REQUEST:
+                dataLength = 16;
+                break;
+            case REPORT_SET_FEATURE_COMMAND:
+                dataLength = 21;
+                break;
+        }
+    }
+
+    bufferIO[0] = dataLength & 0xFF;
+    bufferIO[1] = (dataLength >> 8) & 0x7F;
+
+    // Send packet to IMU
+    #ifdef USE_I2C_DMA
+        //i2c1_transfer_complete = 0;  // Reset DMA transfer complete flag
+        if (HAL_I2C_Master_Transmit_DMA(&hi2c1, BNO_W_ADDR, bufferIO, dataLength) != HAL_OK) {
+            return HAL_ERROR;  // Return error if DMA transmission fails
+        }
+        // Wait for DMA transfer to complete
+        //while (!i2c1_transfer_complete);
+				while (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) { }
+    #else
+        if (HAL_I2C_Master_Transmit(&hi2c1, BNO_W_ADDR, bufferIO, dataLength, HAL_MAX_DELAY) != HAL_OK) {
+            return HAL_ERROR;  // Return error if transmission fails
+        }
+    #endif
+
+    delay_us(RESET_DELAY);  // Delay 100 microseconds before next I2C transmission
+    return HAL_OK;
 }
 
 // Get a data packet from BNO
 static HAL_StatusTypeDef receivePacket(void) {
-	// Reset Interrupt status
-	BNO_Ready = 0;
-	memset(bufferIO, 0, TX_PACKET_SIZE);
-	//Ask for 4 bytes to find out how much data we need to read
-	if(HAL_I2C_Master_Receive(&hi2c1, BNO_R_ADDR, bufferIO, HEADER_SIZE, PORT_TIMEOUT) != HAL_OK) {
-		return HAL_ERROR;
-	}
-	// Calculate the number of data bytes in packet
-	uint16_t rxPacketLength = *(uint16_t *)&bufferIO;//getPacketLenghth();
-	// No data received ?
-	if(!rxPacketLength) {
-		return HAL_ERROR;
-	}
-	if(rxPacketLength > RX_PACKET_SIZE) {
-		return HAL_ERROR;
-	}
-	// Wait 100us
-	delay_us(RESET_DELAY); // Delay 100 microsecs before next I2C
-	if(HAL_I2C_Master_Receive(&hi2c1, BNO_R_ADDR, bufferIO, rxPacketLength, PORT_TIMEOUT) != HAL_OK) {
-		return HAL_ERROR;
-	}
-	delay_us(RESET_DELAY); // Delay 100 microsecs before next I2C
-	return HAL_OK;
+    // Reset interrupt status
+    BNO_Ready = 0;
+    memset(bufferIO, 0, TX_PACKET_SIZE);  // Clear the buffer
+
+    // First, receive the header (4 bytes) to determine the full packet size
+    #ifdef USE_I2C_DMA
+        //i2c1_transfer_complete = 0;  // Reset DMA transfer complete flag
+        if (HAL_I2C_Master_Receive_DMA(&hi2c1, BNO_R_ADDR, bufferIO, HEADER_SIZE) != HAL_OK) {
+            return HAL_ERROR;  // Return error if DMA reception fails
+        }
+        // Wait for DMA transfer to complete
+        //while (!i2c1_transfer_complete);
+				while (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) { }
+    #else
+        if (HAL_I2C_Master_Receive(&hi2c1, BNO_R_ADDR, bufferIO, HEADER_SIZE, HAL_MAX_DELAY) != HAL_OK) {
+            return HAL_ERROR;  // Return error if reception fails
+        }
+    #endif
+
+    // Calculate the number of data bytes in the packet
+    uint16_t rxPacketLength = *(uint16_t *)&bufferIO;
+    if (!rxPacketLength || rxPacketLength > RX_PACKET_SIZE) {
+        return HAL_ERROR;  // Invalid packet size
+    }
+
+    delay_us(RESET_DELAY);  // Delay 100 microseconds before receiving the rest of the packet
+
+    // Now, receive the full packet based on the calculated size
+    #ifdef USE_I2C_DMA
+        //i2c1_transfer_complete = 0;  // Reset DMA transfer complete flag
+        if (HAL_I2C_Master_Receive_DMA(&hi2c1, BNO_R_ADDR, bufferIO, rxPacketLength) != HAL_OK) {
+            return HAL_ERROR;  // Return error if DMA reception fails
+        }
+        // Wait for DMA transfer to complete
+        //while (!i2c1_transfer_complete);
+				while (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) { }
+    #else
+        if (HAL_I2C_Master_Receive(&hi2c1, BNO_R_ADDR, bufferIO, rxPacketLength, HAL_MAX_DELAY) != HAL_OK) {
+            return HAL_ERROR;  // Return error if reception fails
+        }
+    #endif
+
+    delay_us(RESET_DELAY);  // Delay 100 microseconds after receiving the packet
+    return HAL_OK;
 }
+
 
 // Send a command on exe channel
 static HAL_StatusTypeDef sendExecutable(const uint8_t cmd) {
@@ -247,22 +305,22 @@ static void getSensorValue(void) {
 		#ifdef ACCELEROMETER
 		case ACCELEROMETER:
 			sensorData.SenVal.Accelerometer.X = (float)(*(int16_t *)&bufferIO[13]) * SCALE_Q8;
-			sensorData.SenVal.Accelerometer.Y = (float)(*(int16_t *)&bufferIO[13]) * SCALE_Q8;
-			sensorData.SenVal.Accelerometer.Z = (float)(*(int16_t *)&bufferIO[13]) * SCALE_Q8;
+			sensorData.SenVal.Accelerometer.Y = (float)(*(int16_t *)&bufferIO[15]) * SCALE_Q8;
+			sensorData.SenVal.Accelerometer.Z = (float)(*(int16_t *)&bufferIO[17]) * SCALE_Q8;
 		break;
 		#endif
 		#ifdef LINEAR_ACCELERATION
 		case LINEAR_ACCELERATION:
 			sensorData.SenVal.LinearAcceleration.X = (float)(*(int16_t *)&bufferIO[13]) * SCALE_Q8;
-			sensorData.SenVal.LinearAcceleration.Y = (float)(*(int16_t *)&bufferIO[13]) * SCALE_Q8;
-			sensorData.SenVal.LinearAcceleration.Z = (float)(*(int16_t *)&bufferIO[13]) * SCALE_Q8;
+			sensorData.SenVal.LinearAcceleration.Y = (float)(*(int16_t *)&bufferIO[15]) * SCALE_Q8;
+			sensorData.SenVal.LinearAcceleration.Z = (float)(*(int16_t *)&bufferIO[17]) * SCALE_Q8;
 		break;
 		#endif
 		#ifdef GRAVITY
 		case GRAVITY:
 			sensorData.SenVal.Gravity.X = (float)(*(int16_t *)&bufferIO[13]) * SCALE_Q8;
-			sensorData.SenVal.Gravity.Y = (float)(*(int16_t *)&bufferIO[13]) * SCALE_Q8;
-			sensorData.SenVal.Gravity.Z = (float)(*(int16_t *)&bufferIO[13]) * SCALE_Q8;
+			sensorData.SenVal.Gravity.Y = (float)(*(int16_t *)&bufferIO[15]) * SCALE_Q8;
+			sensorData.SenVal.Gravity.Z = (float)(*(int16_t *)&bufferIO[17]) * SCALE_Q8;
 		break;
 		#endif
 		#ifdef RAW_GYROSCOPE
@@ -325,7 +383,7 @@ static void getSensorValue(void) {
 			sensorData.SenVal.RotationVector.Real = (float)(*(int16_t *)&bufferIO[19]) * SCALE_Q14;
 			sensorData.SenVal.RotationVector.Accuracy = (float)(*(int16_t *)&bufferIO[21]) * SCALE_Q14;
 			// Update Euler 
-			//quaternionUpdate(&sensorData.SenVal.RotationVector);
+			quaternionUpdate(&sensorData.SenVal.RotationVector);
 			#else
 			sensorData.SenVal.RotationVector.I = (float)(*(int16_t *)&bufferIO[13]) * SCALE_Q14;
 			sensorData.SenVal.RotationVector.J = (float)(*(int16_t *)&bufferIO[15]) * SCALE_Q14;
@@ -722,6 +780,29 @@ HAL_StatusTypeDef BNO_Init(void) {
 		}
 	//}
 	return HAL_ERROR;
+}
+
+HAL_StatusTypeDef BNO_setHighAccuracyMode(void) {
+    const uint32_t reportIntervalUs = 200000;  // 200 ms = 200,000 microseconds (5Hz)
+
+    // Enable high accuracy for the accelerometer, gyroscope, and magnetometer
+    if (BNO_condigureCalibration(CALIBRATE_ACCEL_GYRO_MAG) == HAL_OK) {
+        // Set high accuracy mode for the Magnetometer (MAGNETIC_FIELD_CALIBRATED)
+        if (BNO_setFeature(MAGNETIC_FIELD_CALIBRATED, reportIntervalUs, 0) == HAL_OK) {
+            // Set high accuracy mode for the Rotation Vector
+            if (BNO_setFeature(ROTATION_VECTOR, reportIntervalUs, 0) == HAL_OK) {
+                // Optionally: Set high accuracy for the accelerometer, gyroscope, etc.
+                // Uncomment these if you need high accuracy on other sensors.
+                
+                if (BNO_setFeature(ACCELEROMETER, reportIntervalUs, 0) != HAL_OK) return HAL_ERROR;
+                if (BNO_setFeature(GYROSCOPE_CALIBRATED, reportIntervalUs, 0) != HAL_OK) return HAL_ERROR;
+
+                // All configurations successful
+                return HAL_OK;
+            }
+        }
+    }
+    return HAL_ERROR;  // Return an error if any step fails
 }
 
 // Check if we have unexpected reset
@@ -1160,49 +1241,57 @@ HAL_StatusTypeDef BNO_isCalibrationComplete(void) {
 #ifdef USE_FOR_TELESCOPE
 
 HAL_StatusTypeDef setTelescopeOrientation(void) {
-	if(BNO_TareNow(TARE_ALL, RotationVector) == HAL_OK){
-		// -X North, Y East Z down
-		if(BNO_TareSetReorientation(0.0, 0.0, 0.0, Q_FLIP) == HAL_OK){
-			// Save new orientation and reset
-			if(BNO_TarePerist() == HAL_OK){
-				return BNO_Reset();
-			}
-		}
-	}
-	return HAL_ERROR;
+    if(BNO_TareNow(TARE_ALL, RotationVector) == HAL_OK) {
+        // -X North, Y East, Z Up
+        if(BNO_TareSetReorientation(Q_FLIP, 0.0, 0.0, -Q_FLIP) == HAL_OK) {
+            // Save new orientation and reset
+            if(BNO_TarePerist() == HAL_OK) {
+                if (BNO_Reset() == HAL_OK) {
+                    // Optionally, check calibration completeness
+                    return BNO_isCalibrationComplete();
+                }
+            }
+        }
+    }
+    return HAL_ERROR;
 }
 
 // Start the calibration for 20s or until accuracy is 3
 HAL_StatusTypeDef BNO_calibrateHighAccuracyAndReset(void) {
-	const uint16_t calibrationTime = 26000;
-	if(BNO_condigureCalibration(CALIBRATE_ACCEL_GYRO_MAG) == HAL_OK) {
-		if(BNO_setFeature(MAGNETIC_FIELD_CALIBRATED, 100000, 0) == HAL_OK) {
-			if(BNO_setFeature(GAME_ROTATION_VECTOR, 100000, 0) == HAL_OK) {
-				uint32_t startTime = HAL_GetTick() + calibrationTime;
-				uint8_t magA,grvA = 0;
-				while(HAL_GetTick() < startTime) {
-					if((BNO_dataAvailable() == HAL_OK) && sensorData.sensorId){
-						if(sensorData.sensorId == MAGNETIC_FIELD_CALIBRATED){
-							magA = sensorData.status;
-							//printf("MagA=%d\r\n", magA);
-						}
-						if(sensorData.sensorId == GAME_ROTATION_VECTOR){
-							grvA = sensorData.status;
-							//printf("GrvA=%d\r\n", grvA);
-						}
-						sensorData.sensorId = 0;
-					}
-					// If we have maximum accuracy we stop
-					if((magA == 3) && (grvA == 3))
-						break;
-				}
-				if(BNO_saveCalibration() == HAL_OK){
-					return BNO_Reset();
-				}
-			}
-		}
-	}
-	return HAL_ERROR;
+    const uint16_t calibrationTime = 26000;  // Adjust this value as needed
+    if(BNO_condigureCalibration(CALIBRATE_ACCEL_GYRO_MAG) == HAL_OK) {
+        if(BNO_setFeature(MAGNETIC_FIELD_CALIBRATED, 100000, 0) == HAL_OK) {
+            if(BNO_setFeature(GAME_ROTATION_VECTOR, 100000, 0) == HAL_OK) {
+                uint32_t startTime = HAL_GetTick() + calibrationTime;
+                uint8_t magA = 0, grvA = 0;
+
+                while(HAL_GetTick() < startTime) {
+                    if ((BNO_dataAvailable() == HAL_OK) && sensorData.sensorId) {
+                        if (sensorData.sensorId == MAGNETIC_FIELD_CALIBRATED) {
+                            magA = sensorData.status;
+                            // printf("MagA=%d\r\n", magA);  // Optional debug logging
+                        }
+                        if (sensorData.sensorId == GAME_ROTATION_VECTOR) {
+                            grvA = sensorData.status;
+                            // printf("GrvA=%d\r\n", grvA);  // Optional debug logging
+                        }
+                        sensorData.sensorId = 0;  // Reset the sensor ID after processing
+                    }
+
+                    // If both magnetometer and rotation vector have maximum accuracy, stop calibration
+                    if ((magA == 3) && (grvA == 3)) {
+                        break;
+                    }
+                }
+
+                // Save calibration if completed successfully
+                if (BNO_saveCalibration() == HAL_OK) {
+                    return BNO_Reset();  // Reset after calibration
+                }
+            }
+        }
+    }
+    return HAL_ERROR;  // Return error if any step fails
 }
 #endif
 // Check if we have new data
