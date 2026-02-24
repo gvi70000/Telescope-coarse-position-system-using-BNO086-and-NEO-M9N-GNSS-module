@@ -2,241 +2,479 @@
 #include "spi.h"
 #include "gpio.h"
 
-// 
-static HAL_StatusTypeDef EEPROM_isSpiReady(){
+// Wait for SPI peripheral to become ready
+/**
+ * @brief EEPROM_isSpiReady function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @return HAL status.
+ */
+static HAL_StatusTypeDef EEPROM_isSpiReady(SPI_HandleTypeDef* hspi) {
 	uint32_t startTime = HAL_GetTick();
-	while(hspi1.State != HAL_SPI_STATE_READY) {
-		if (HAL_GetTick() - startTime >= EEPROM_TIMEOUT) return HAL_TIMEOUT;  // Return timeout status if we exceed the timeout duration
+	while (hspi->State != HAL_SPI_STATE_READY) {
+		if (HAL_GetTick() - startTime >= EEPROM_TIMEOUT) {
+			return HAL_TIMEOUT;  // SPI peripheral did not become ready in time
+		}
 		HAL_Delay(1);
 	}
 	return HAL_OK;
 }
 
-static HAL_StatusTypeDef EEPROM_WaitStandbyState(void) {
-	EEPROM_SELECT;
-	// Transmit the command to read the status register
-	if(HAL_SPI_Transmit(&hspi1, (uint8_t[]){RDSR}, SIZE_1, EEPROM_TIMEOUT) != HAL_OK) {
-		EEPROM_RELEASE;
-		return HAL_ERROR; // Failed to transmit the RDSR command
-	}
-	uint32_t startTime = HAL_GetTick(); // Store the start time
+// Poll WIP bit until write cycle completes or timeout expires
+/**
+ * @brief EEPROM_WaitStandbyState function implementation.
+ * @details Polls the Write In Progress (WIP) bit of the status register.
+ *          Each poll issues a complete RDSR transaction (CS low -> 0x05 -> read byte -> CS high)
+ *          as required by the M95512 datasheet (Figure 10). The previous implementation
+ *          incorrectly released CS between the command and the read, returning garbage data.
+ * @param hspi Pointer to SPI handle.
+ * @return HAL status.
+ */
+static HAL_StatusTypeDef EEPROM_WaitStandbyState(SPI_HandleTypeDef* hspi) {
+	uint8_t cmd    = RDSR;
 	uint8_t status = 0;
-	while(1){
-		// Check if the timeout has been exceeded
-		if (HAL_GetTick() - startTime >= EEPROM_TIMEOUT) {
-			EEPROM_RELEASE;
-			return HAL_TIMEOUT; // Return timeout status if we exceed the timeout duration
+	uint32_t startTime = HAL_GetTick();
+
+	while (1) {
+		if (HAL_GetTick() - startTime >= EEPROM_WRITE_TIMEOUT) {
+			return HAL_TIMEOUT;  // Write cycle did not complete within EEPROM_WRITE_TIMEOUT
 		}
-		// Receive the status register
-		if(HAL_SPI_Receive(&hspi1, &status, SIZE_1, EEPROM_TIMEOUT) != HAL_OK){
+
+		// Each iteration is a complete, self-contained RDSR transaction:
+		// CS low -> send RDSR command -> read status byte -> CS high
+		EEPROM_SELECT;
+		if (HAL_SPI_Transmit(hspi, &cmd, SIZE_1, EEPROM_TIMEOUT) != HAL_OK) {
 			EEPROM_RELEASE;
-			return HAL_ERROR; // Error in receiving data
+			return HAL_ERROR;  // Failed to transmit RDSR command
 		}
-		// Check the Write In Progress bit
-		if ((status & WIP) == 0) break; // Exit the loop if the EEPROM is not busy
-		// Adding a delay to avoid spamming the SPI bus too aggressively
-		HAL_Delay(1);
-	};
-	EEPROM_RELEASE;
-	return HAL_OK; // EEPROM is ready
+		if (HAL_SPI_Receive(hspi, &status, SIZE_1, EEPROM_TIMEOUT) != HAL_OK) {
+			EEPROM_RELEASE;
+			return HAL_ERROR;  // Failed to receive status byte
+		}
+		EEPROM_RELEASE;
+
+		if ((status & WIP) == 0) {
+			return HAL_OK;  // Write cycle complete
+		}
+		HAL_Delay(1);  // Avoid hammering the SPI bus; tW is up to 5ms
+	}
 }
 
 // Enable write operation
-HAL_StatusTypeDef EEPROM_WriteEnable(void) {
+/**
+ * @brief EEPROM_WriteEnable function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_WriteEnable(SPI_HandleTypeDef* hspi) {
+	uint8_t cmd = WREN;
 	EEPROM_SELECT;
-	HAL_StatusTypeDef status = HAL_SPI_Transmit(&hspi1, (uint8_t[]){WREN}, SIZE_1, EEPROM_TIMEOUT);
+	HAL_StatusTypeDef status = HAL_SPI_Transmit(hspi, &cmd, SIZE_1, EEPROM_TIMEOUT);
 	EEPROM_RELEASE;
 	return status;
 }
 
 // Disable write operation
-HAL_StatusTypeDef EEPROM_WriteDisable(void) {
+/**
+ * @brief EEPROM_WriteDisable function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_WriteDisable(SPI_HandleTypeDef* hspi) {
+	uint8_t cmd = WRDI;
 	EEPROM_SELECT;
-	HAL_StatusTypeDef status = HAL_SPI_Transmit(&hspi1, (uint8_t[]){WRDI}, SIZE_1, EEPROM_TIMEOUT);
+	HAL_StatusTypeDef status = HAL_SPI_Transmit(hspi, &cmd, SIZE_1, EEPROM_TIMEOUT);
 	EEPROM_RELEASE;
 	return status;
 }
 
 // Read status register
-uint8_t EEPROM_ReadStatus(void) {
-	uint8_t status;
+/**
+ * @brief EEPROM_ReadStatus function implementation.
+ * @details Issues a single CS-low transaction: send RDSR (0x05), read 1 status byte.
+ *          The previous implementation split this into two separate CS transactions,
+ *          which meant the receive had no valid command context and returned garbage.
+ * @param hspi Pointer to SPI handle.
+ * @param status Pointer to byte to receive the status register value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_ReadStatus(SPI_HandleTypeDef* hspi, uint8_t* status) {
+	uint8_t cmd = RDSR;
 	EEPROM_SELECT;
-	HAL_SPI_Transmit(&hspi1, (uint8_t[]){RDSR}, SIZE_1, EEPROM_TIMEOUT);
+	if (HAL_SPI_Transmit(hspi, &cmd, SIZE_1, EEPROM_TIMEOUT) != HAL_OK) {
+		EEPROM_RELEASE;
+		return HAL_ERROR;  // Failed to transmit RDSR command
+	}
+	if (HAL_SPI_Receive(hspi, status, SIZE_1, EEPROM_TIMEOUT) != HAL_OK) {
+		EEPROM_RELEASE;
+		return HAL_ERROR;  // Failed to receive status byte
+	}
 	EEPROM_RELEASE;
-	EEPROM_SELECT;
-	HAL_SPI_Receive(&hspi1, &status, SIZE_1, EEPROM_TIMEOUT);
-	EEPROM_RELEASE;
-	return status;
+	return HAL_OK;
 }
 
 // Write status register
-HAL_StatusTypeDef EEPROM_WriteStatus(const uint8_t status) {
-	// Attempt to enable writing to the EEPROM first.
-	if(EEPROM_WriteEnable() != HAL_OK) {
-		return HAL_ERROR; // Early return if write enable fails.
+/**
+ * @brief EEPROM_WriteStatus function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param status New status register value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_WriteStatus(SPI_HandleTypeDef* hspi, const uint8_t status) {
+	if (EEPROM_WriteEnable(hspi) != HAL_OK) {
+		return HAL_ERROR;  // Failed to set Write Enable Latch
 	}
-	// Prepare the command buffer with the Write Status Register command and the new status.
 	uint8_t cmd[SIZE_2] = {WRSR, status};
-	EEPROM_SELECT; // Select the EEPROM to start the communication.
-	// Transmit the command and the new status to the EEPROM.
-	HAL_StatusTypeDef result = HAL_SPI_Transmit(&hspi1, cmd, SIZE_2, EEPROM_TIMEOUT);
-	EEPROM_RELEASE; // Release the EEPROM as soon as the transmission is done.
-	// If the SPI transmission was successful, attempt to disable writing.
-	// Otherwise, return HAL_ERROR immediately.
-	if(result == HAL_OK) {
-		return EEPROM_WriteDisable(); // Attempt to disable writing and return the result.
+	EEPROM_SELECT;
+	HAL_StatusTypeDef result = HAL_SPI_Transmit(hspi, cmd, SIZE_2, EEPROM_TIMEOUT);
+	EEPROM_RELEASE;
+	if (result != HAL_OK) {
+		return HAL_ERROR;  // Failed to transmit WRSR command
 	}
-	return HAL_ERROR; // Return HAL_ERROR if the transmission failed.
+	return EEPROM_WaitStandbyState(hspi);  // Wait for write cycle to complete
 }
 
-// Read an ammout of data from EEPROM
-HAL_StatusTypeDef EEPROM_ReadData(const uint16_t address, uint8_t *data, const uint16_t size) {
-	// First, check if SPI is ready for communication.
-	if (EEPROM_isSpiReady() != HAL_OK) return HAL_ERROR; // SPI is not ready, return error immediately.
-	EEPROM_SELECT; // Select the EEPROM to start the communication.
-	// Prepare the command buffer with the Read command followed by the address.
+// Read an amount of data from EEPROM
+/**
+ * @brief EEPROM_ReadData function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Start address.
+ * @param data Pointer to receive buffer.
+ * @param size Number of bytes to read.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_ReadData(SPI_HandleTypeDef* hspi, const uint16_t address, uint8_t* data, const uint16_t size) {
+	if ((uint32_t)address + size > EEPROM_TOTAL_SIZE) {
+		return HAL_ERROR;  // Read would exceed chip address space
+	}
+	if (EEPROM_isSpiReady(hspi) != HAL_OK) {
+		return HAL_ERROR;  // SPI peripheral not ready
+	}
 	uint8_t cmd[SIZE_3] = {READ, (uint8_t)(address >> 8), (uint8_t)address};
-	// Transmit the read command with the address.
-	if (HAL_SPI_Transmit(&hspi1, cmd, SIZE_3, EEPROM_TIMEOUT) != HAL_OK) {
-		EEPROM_RELEASE; // Make sure to release the EEPROM before returning.
-		return HAL_ERROR; // Transmission failed, return error.
+	EEPROM_SELECT;
+	if (HAL_SPI_Transmit(hspi, cmd, SIZE_3, EEPROM_TIMEOUT) != HAL_OK) {
+		EEPROM_RELEASE;
+		return HAL_ERROR;  // Failed to transmit READ command
 	}
-	// Receive the data from EEPROM.
-	HAL_StatusTypeDef result = HAL_SPI_Receive(&hspi1, data, size, EEPROM_TIMEOUT);
-	EEPROM_RELEASE; // Release the EEPROM after receiving the data.
-	return result; // Return the result of the SPI receive operation.
+	HAL_StatusTypeDef result = HAL_SPI_Receive(hspi, data, size, EEPROM_TIMEOUT);
+	EEPROM_RELEASE;
+	return result;
 }
 
-// Function to write a page of data to EEPROM at a specified address
-HAL_StatusTypeDef EEPROM_WritePage(const uint16_t address, const uint8_t *data, const uint8_t size) {
-	// Validate that the write operation does not exceed the EEPROM page boundaries.
+// Write a single page of data (must not cross a page boundary)
+/**
+ * @brief EEPROM_WritePage function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Start address.
+ * @param data Pointer to data buffer.
+ * @param size Number of bytes to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_WritePage(SPI_HandleTypeDef* hspi, const uint16_t address, const uint8_t* data, const uint8_t size) {
+	// Validate: size must not exceed page size, and write must not cross a page boundary
 	if (size > PAGE_SIZE || (address / PAGE_SIZE) != ((address + size - 1) / PAGE_SIZE)) {
-		return HAL_ERROR; // Exceeds page size or spans across pages.
+		return HAL_ERROR;  // Exceeds page size or spans page boundary
 	}
-	// Ensure SPI is ready and writing is enabled before proceeding.
-	if (EEPROM_isSpiReady() != HAL_OK || EEPROM_WriteEnable() != HAL_OK) {
-		return HAL_ERROR; // SPI not ready or unable to enable write operation.
+	// Validate: write must not exceed total chip address space
+	if ((uint32_t)address + size > EEPROM_TOTAL_SIZE) {
+		return HAL_ERROR;  // Exceeds chip address space
 	}
-	EEPROM_SELECT; // Select the EEPROM to start the communication.
-	// Prepare and transmit the WRITE command along with the address.
+	if (EEPROM_isSpiReady(hspi) != HAL_OK) {
+		return HAL_ERROR;  // SPI peripheral not ready
+	}
+	if (EEPROM_WriteEnable(hspi) != HAL_OK) {
+		return HAL_ERROR;  // Failed to set Write Enable Latch
+	}
 	uint8_t cmd[SIZE_3] = {WRITE, (uint8_t)(address >> 8), (uint8_t)address};
-	if (HAL_SPI_Transmit(&hspi1, cmd, SIZE_3, EEPROM_TIMEOUT) != HAL_OK) {
+	EEPROM_SELECT;
+	if (HAL_SPI_Transmit(hspi, cmd, SIZE_3, EEPROM_TIMEOUT) != HAL_OK) {
 		EEPROM_RELEASE;
-		return HAL_ERROR; // Failed to transmit the write command.
+		return HAL_ERROR;  // Failed to transmit WRITE command
 	}
-	// Transmit the data to be written to the EEPROM.
-	if (HAL_SPI_Transmit(&hspi1, (uint8_t*)data, size, EEPROM_TIMEOUT) != HAL_OK) {
+	if (HAL_SPI_Transmit(hspi, (uint8_t*)data, size, EEPROM_TIMEOUT) != HAL_OK) {
 		EEPROM_RELEASE;
-		return HAL_ERROR; // Failed to transmit the data.
+		return HAL_ERROR;  // Failed to transmit data bytes
 	}
-	EEPROM_RELEASE; // Release the EEPROM after the transmit operation.
-	// Wait for the EEPROM to complete the write operation.
-	if (EEPROM_WaitStandbyState() != HAL_OK) {
-		return HAL_ERROR; // Write operation did not complete successfully.
-	}
-	// Finally, disable the write operation.
-	return EEPROM_WriteDisable();
+	EEPROM_RELEASE;  // Rising CS edge triggers the internal write cycle (tW)
+	return EEPROM_WaitStandbyState(hspi);  // Poll WIP until write cycle completes
 }
 
-// Write any amount of data across several pages in an EEPROM
-HAL_StatusTypeDef EEPROM_WriteDataMultiPage(const uint16_t startAddress, const uint8_t* data, const uint16_t size) {
-	uint16_t bytesWritten = 0; // Track the number of bytes written
-	const uint8_t* currentDataPointer = data; // Pointer to track the current position in the data buffer
+// Write any amount of data, splitting across pages as needed
+/**
+ * @brief EEPROM_WriteDataMultiPage function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param startAddress Start address.
+ * @param data Pointer to data buffer.
+ * @param size Total number of bytes to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_WriteDataMultiPage(SPI_HandleTypeDef* hspi, const uint16_t startAddress, const uint8_t* data, const uint16_t size) {
+	if ((uint32_t)startAddress + size > EEPROM_TOTAL_SIZE) {
+		return HAL_ERROR;  // Write would exceed chip address space
+	}
+	uint16_t bytesWritten = 0;
+	const uint8_t* currentData = data;
+
 	while (bytesWritten < size) {
-		// Calculate the start address for the current chunk of data
-		uint16_t currentAddress = startAddress + bytesWritten;
-		// Calculate how much data can be written in the current page without crossing the boundary
-		uint16_t currentPageSize = PAGE_SIZE - (currentAddress % PAGE_SIZE);
-		uint16_t bytesToWrite = ((size - bytesWritten) < currentPageSize) ? (size - bytesWritten) : currentPageSize;
-		// Write the data to the current page
-		HAL_StatusTypeDef status = EEPROM_WritePage(currentAddress, currentDataPointer, bytesToWrite);
+		uint16_t currentAddress  = startAddress + bytesWritten;
+		uint16_t spaceInPage     = PAGE_SIZE - (currentAddress % PAGE_SIZE);
+		uint16_t bytesToWrite    = ((size - bytesWritten) < spaceInPage) ? (size - bytesWritten) : spaceInPage;
+
+		HAL_StatusTypeDef status = EEPROM_WritePage(hspi, currentAddress, currentData, (uint8_t)bytesToWrite);
 		if (status != HAL_OK) {
-			// Handle error
-			return status; // Return the error status if the write operation failed
+			return status;  // Propagate error from page write
 		}
-		// Update the number of bytes written and the data pointer
 		bytesWritten += bytesToWrite;
-		currentDataPointer += bytesToWrite;
+		currentData  += bytesToWrite;
 	}
-	return HAL_OK; // Return success after writing all data
+	return HAL_OK;
 }
 
-HAL_StatusTypeDef EEPROM_Write_8(const uint16_t address, int8_t value) {
-	return EEPROM_WritePage(address, (uint8_t *)&value, SIZE_1);
+// Typed write helpers
+/**
+ * @brief EEPROM_Write_8 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Target address.
+ * @param value Value to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Write_8(SPI_HandleTypeDef* hspi, const uint16_t address, int8_t value) {
+	return EEPROM_WritePage(hspi, address, (uint8_t*)&value, SIZE_1);
 }
 
-HAL_StatusTypeDef EEPROM_Write_16(const uint16_t address, int16_t value) {
-	return EEPROM_WritePage(address, (uint8_t *)&value, SIZE_2);
+/**
+ * @brief EEPROM_Write_16 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Target address.
+ * @param value Value to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Write_16(SPI_HandleTypeDef* hspi, const uint16_t address, int16_t value) {
+	return EEPROM_WritePage(hspi, address, (uint8_t*)&value, SIZE_2);
 }
 
-HAL_StatusTypeDef EEPROM_Write_32(const uint16_t address, int32_t value) {
-	return EEPROM_WritePage(address, (uint8_t *)&value, SIZE_4);
+/**
+ * @brief EEPROM_Write_32 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Target address.
+ * @param value Value to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Write_32(SPI_HandleTypeDef* hspi, const uint16_t address, int32_t value) {
+	return EEPROM_WritePage(hspi, address, (uint8_t*)&value, SIZE_4);
 }
 
-HAL_StatusTypeDef EEPROM_Write_64(const uint16_t address, int64_t value) {
-	return EEPROM_WritePage(address, (uint8_t *)&value, SIZE_8);
+/**
+ * @brief EEPROM_Write_64 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Target address.
+ * @param value Value to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Write_64(SPI_HandleTypeDef* hspi, const uint16_t address, int64_t value) {
+	return EEPROM_WritePage(hspi, address, (uint8_t*)&value, SIZE_8);
 }
 
-HAL_StatusTypeDef EEPROM_Write_U8(const uint16_t address, uint8_t value) {
-	return EEPROM_WritePage(address, &value, SIZE_1);
+/**
+ * @brief EEPROM_Write_U8 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Target address.
+ * @param value Value to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Write_U8(SPI_HandleTypeDef* hspi, const uint16_t address, uint8_t value) {
+	return EEPROM_WritePage(hspi, address, &value, SIZE_1);
 }
 
-HAL_StatusTypeDef EEPROM_Write_U16(const uint16_t address, const uint16_t value) {
-	return EEPROM_Write_16(address, (int16_t)value);
+/**
+ * @brief EEPROM_Write_U16 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Target address.
+ * @param value Value to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Write_U16(SPI_HandleTypeDef* hspi, const uint16_t address, uint16_t value) {
+	return EEPROM_WritePage(hspi, address, (uint8_t*)&value, SIZE_2);
 }
 
-HAL_StatusTypeDef EEPROM_Write_U32(const uint16_t address, const uint32_t value) {
-	return EEPROM_Write_32(address, (int32_t)value);
+/**
+ * @brief EEPROM_Write_U32 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Target address.
+ * @param value Value to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Write_U32(SPI_HandleTypeDef* hspi, const uint16_t address, uint32_t value) {
+	return EEPROM_WritePage(hspi, address, (uint8_t*)&value, SIZE_4);
 }
 
-HAL_StatusTypeDef EEPROM_Write_Float(const uint16_t address, const float value) {
-	return EEPROM_WritePage(address, (uint8_t *)&value, SIZE_4);
+/**
+ * @brief EEPROM_Write_U64 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Target address.
+ * @param value Value to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Write_U64(SPI_HandleTypeDef* hspi, const uint16_t address, uint64_t value) {
+	return EEPROM_WritePage(hspi, address, (uint8_t*)&value, SIZE_8);
 }
 
-HAL_StatusTypeDef EEPROM_Write_U64(const uint16_t address, const uint64_t value) {
-	return EEPROM_Write_64(address, (int64_t)value);
+/**
+ * @brief EEPROM_Write_Float function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Target address.
+ * @param value Value to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Write_Float(SPI_HandleTypeDef* hspi, const uint16_t address, float value) {
+	return EEPROM_WritePage(hspi, address, (uint8_t*)&value, SIZE_4);
 }
 
-HAL_StatusTypeDef EEPROM_Write_Double(const uint16_t address, const double value) {
-	return EEPROM_WritePage(address, (uint8_t *)&value, SIZE_8);
+/**
+ * @brief EEPROM_Write_Double function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Target address.
+ * @param value Value to write.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Write_Double(SPI_HandleTypeDef* hspi, const uint16_t address, double value) {
+	return EEPROM_WritePage(hspi, address, (uint8_t*)&value, SIZE_8);
 }
 
-HAL_StatusTypeDef EEPROM_Read_8(const uint16_t address, int8_t *value) {
-	return EEPROM_ReadData(address, (uint8_t *)value, SIZE_1);
+// Typed read helpers
+/**
+ * @brief EEPROM_Read_8 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Source address.
+ * @param value Pointer to receive the value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Read_8(SPI_HandleTypeDef* hspi, const uint16_t address, int8_t* value) {
+	return EEPROM_ReadData(hspi, address, (uint8_t*)value, SIZE_1);
 }
 
-HAL_StatusTypeDef EEPROM_Read_16(const uint16_t address, int16_t *value) {
-	return EEPROM_ReadData(address, (uint8_t *)value, SIZE_2);
+/**
+ * @brief EEPROM_Read_16 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Source address.
+ * @param value Pointer to receive the value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Read_16(SPI_HandleTypeDef* hspi, const uint16_t address, int16_t* value) {
+	return EEPROM_ReadData(hspi, address, (uint8_t*)value, SIZE_2);
 }
 
-HAL_StatusTypeDef EEPROM_Read_32(const uint16_t address, int32_t *value) {
-	return EEPROM_ReadData(address, (uint8_t *)value, SIZE_4);
+/**
+ * @brief EEPROM_Read_32 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Source address.
+ * @param value Pointer to receive the value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Read_32(SPI_HandleTypeDef* hspi, const uint16_t address, int32_t* value) {
+	return EEPROM_ReadData(hspi, address, (uint8_t*)value, SIZE_4);
 }
 
-HAL_StatusTypeDef EEPROM_Read_64(const uint16_t address, int64_t *value) {
-	return EEPROM_ReadData(address, (uint8_t *)value, SIZE_8);
+/**
+ * @brief EEPROM_Read_64 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Source address.
+ * @param value Pointer to receive the value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Read_64(SPI_HandleTypeDef* hspi, const uint16_t address, int64_t* value) {
+	return EEPROM_ReadData(hspi, address, (uint8_t*)value, SIZE_8);
 }
 
-HAL_StatusTypeDef EEPROM_Read_U8(const uint16_t address, uint8_t *value) {
-	return EEPROM_ReadData(address, value, SIZE_1);
+/**
+ * @brief EEPROM_Read_U8 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Source address.
+ * @param value Pointer to receive the value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Read_U8(SPI_HandleTypeDef* hspi, const uint16_t address, uint8_t* value) {
+	return EEPROM_ReadData(hspi, address, value, SIZE_1);
 }
 
-HAL_StatusTypeDef EEPROM_Read_U16(const uint16_t address, uint16_t *value) {
-	return EEPROM_Read_16(address, (int16_t *)value);
+/**
+ * @brief EEPROM_Read_U16 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Source address.
+ * @param value Pointer to receive the value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Read_U16(SPI_HandleTypeDef* hspi, const uint16_t address, uint16_t* value) {
+	return EEPROM_ReadData(hspi, address, (uint8_t*)value, SIZE_2);
 }
 
-HAL_StatusTypeDef EEPROM_Read_U32(const uint16_t address, uint32_t *value) {
-	return EEPROM_Read_32(address, (int32_t *)value);
+/**
+ * @brief EEPROM_Read_U32 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Source address.
+ * @param value Pointer to receive the value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Read_U32(SPI_HandleTypeDef* hspi, const uint16_t address, uint32_t* value) {
+	return EEPROM_ReadData(hspi, address, (uint8_t*)value, SIZE_4);
 }
 
-HAL_StatusTypeDef EEPROM_Read_Float(const uint16_t address, float *value) {
-	return EEPROM_Read_32(address, (int32_t *)value);
+/**
+ * @brief EEPROM_Read_U64 function implementation.
+ * @param hspi Pointer to SPI handle.
+ * @param address Source address.
+ * @param value Pointer to receive the value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Read_U64(SPI_HandleTypeDef* hspi, const uint16_t address, uint64_t* value) {
+	return EEPROM_ReadData(hspi, address, (uint8_t*)value, SIZE_8);
 }
 
-HAL_StatusTypeDef EEPROM_Read_U64(const uint16_t address, uint64_t *value) {
-	return EEPROM_Read_64(address, (int64_t *)value);
+/**
+ * @brief EEPROM_Read_Float function implementation.
+ * @details Uses a byte-copy via memcpy-equivalent union to avoid strict aliasing violation.
+ *          The previous implementation cast float* to int32_t* which is undefined behaviour.
+ * @param hspi Pointer to SPI handle.
+ * @param address Source address.
+ * @param value Pointer to receive the value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Read_Float(SPI_HandleTypeDef* hspi, const uint16_t address, float* value) {
+	uint8_t bytes[SIZE_4];
+	HAL_StatusTypeDef status = EEPROM_ReadData(hspi, address, bytes, SIZE_4);
+	if (status != HAL_OK) {
+		return status;
+	}
+	// Safe type-pun via union (defined behaviour in C99/C11)
+	union { uint8_t b[4]; float f; } pun;
+	pun.b[0] = bytes[0];
+	pun.b[1] = bytes[1];
+	pun.b[2] = bytes[2];
+	pun.b[3] = bytes[3];
+	*value = pun.f;
+	return HAL_OK;
 }
 
-HAL_StatusTypeDef EEPROM_Read_Double(const uint16_t address, double *value) {
-	return EEPROM_Read_64(address, (int64_t *)value);
+/**
+ * @brief EEPROM_Read_Double function implementation.
+ * @details Uses a byte-copy via union to avoid strict aliasing violation.
+ *          The previous implementation cast double* to int64_t* which is undefined behaviour.
+ * @param hspi Pointer to SPI handle.
+ * @param address Source address.
+ * @param value Pointer to receive the value.
+ * @return HAL status.
+ */
+HAL_StatusTypeDef EEPROM_Read_Double(SPI_HandleTypeDef* hspi, const uint16_t address, double* value) {
+	uint8_t bytes[SIZE_8];
+	HAL_StatusTypeDef status = EEPROM_ReadData(hspi, address, bytes, SIZE_8);
+	if (status != HAL_OK) {
+		return status;
+	}
+	// Safe type-pun via union (defined behaviour in C99/C11)
+	union { uint8_t b[8]; double d; } pun;
+	pun.b[0] = bytes[0]; pun.b[1] = bytes[1];
+	pun.b[2] = bytes[2]; pun.b[3] = bytes[3];
+	pun.b[4] = bytes[4]; pun.b[5] = bytes[5];
+	pun.b[6] = bytes[6]; pun.b[7] = bytes[7];
+	*value = pun.d;
+	return HAL_OK;
 }
