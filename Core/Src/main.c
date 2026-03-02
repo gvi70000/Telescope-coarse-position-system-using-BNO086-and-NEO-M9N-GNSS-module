@@ -16,8 +16,10 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "crc.h"
 #include "dma.h"
 #include "i2c.h"
 #include "spi.h"
@@ -28,9 +30,11 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
 #include "BNO_08x_I2C.h"
 #include "NEO_M9N.h"
 #include "BMP581.h"
+#include "HDC302x.h"
 #include "EEPROM_SPI.h"
 /* USER CODE END Includes */
 
@@ -64,135 +68,170 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-// Used to indicate USART1 transmission complete
+// USART1 transmit complete flag — cleared by HAL_UART_TxCpltCallback, polled by transmitFrame()
 volatile uint8_t txNotComplete = 0;
-// Holds the command received from main controller
+// Command received from main controller over USART1
 volatile uint8_t crtCmd = 0;
 
-// Indicates that BMP581 has raised interrupt
-volatile uint8_t BMP_Ready;
-// Holds pressure and temperature
+// BMP581 data-ready flag — set by HAL_GPIO_EXTI_Callback on BMP_INT_Pin
+volatile uint8_t BMP_Ready = 0;
+// BMP581 pressure and temperature result
 BMP581_sensor_data_t BMP581_Data;
 
-// Indicates that BNO086 has raised interrupt
-extern volatile uint8_t BNO_Ready;
-// Holds BNO086 data
-extern BNO_SensorValue_t sensorData;
+// BNO086 data-ready flag — set by HAL_GPIO_EXTI_Callback on BNO_INT_Pin
+// sensorData and rpy externs come from BNO_08x_I2C.h
+volatile uint8_t BNO_Ready = 0;
 
-// Halds GPS data
-extern GPS_DATA_t myGpsData;
+// HDC302x sensor handles — Address set before HDC302x_Init()
+HDC302x_t Sensor1;
+HDC302x_t Sensor2;
+// HDC302x data-ready flags — set by HAL_GPIO_EXTI_Callback on A1_Pin / A2_Pin
+volatile uint8_t HDC1_Ready = 0;
+volatile uint8_t HDC2_Ready = 0;
+// Timestamp of last HDC302x read, used to enforce HDC_READ_TIME interval
+uint32_t readTime;
 
-// Buffer for USART1 Rx
-extern volatile uint8_t gpsRxBuffer[RX_BUFFER_LEN];
+// Latest HDC302x readings — used to compute avgTemp and avgRH in sendData()
+float temp1 = 0.0f;
+float temp2 = 0.0f;
+float rh1   = 0.0f;
+float rh2   = 0.0f;
 
-// Interrupt callback function for BMP581 and BNO086
+// GPS new-data flag — set in HAL_UART_RxCpltCallback, cleared in main loop
+// myGpsData and gpsData declared in NEO_M9N.h / NEO_M9N.c
+volatile uint8_t newGpsData = 0;
+
+// Transmit buffer — aligned(4) so HAL_CRC_Calculate() can safely cast to uint32_t*
+// Unaligned 32-bit reads are UB on Cortex-M4
+__attribute__((aligned(4))) uint8_t txBuffer[TX_LONG_SIZE];
+
+// EXTI callback — sets sensor ready flags
+// NOTE: HAL_GPIO_EXTI_IRQHandler already clears the pending bit. Do NOT call
+// __HAL_GPIO_EXTI_CLEAR_IT here; it can re-trigger the interrupt on some STM32F3 silicon.
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-  if(GPIO_Pin == BMP_INT_Pin) {
-    BMP_Ready = 1;
-  }
-	
-  if(GPIO_Pin == BNO_INT_Pin) {
-    BNO_Ready = 1;
-  }
-	__HAL_GPIO_EXTI_CLEAR_IT(GPIO_Pin);
+    if (GPIO_Pin == BMP_INT_Pin) {
+        BMP_Ready = 1;
+    }
+    if (GPIO_Pin == BNO_INT_Pin) {
+        BNO_Ready = 1;
+    }
+    if (GPIO_Pin == A1_Pin) {   // HDC Sensor 1 INTDRDY (active-low, FALLING edge)
+        HDC1_Ready = 1;
+    }
+    if (GPIO_Pin == A2_Pin) {   // HDC Sensor 2 INTDRDY (active-low, FALLING edge)
+        HDC2_Ready = 1;
+    }
 }
 
-// Function to generate checksum and place it in the last position of the array
-void generateChecksum(uint8_t *array, uint8_t length) {
-	uint8_t checkSum = 0;
-	if (length < 3) return; // Ensure there's enough length for start, char, and checksum
-	for (uint16_t i = 1; i < length - 1; i++) {
-		checkSum += array[i];
-	}
-	array[length - 1] = checkSum; // Store the checksum in the last position
+// Calculate CRC32 over txBuffer[0..length-1] and write the result at CRC_POS
+// length must be a multiple of 4; HAL_CRC_Calculate() counts uint32_t words
+void calculateAndAppendCRC(uint16_t length) {
+    uint32_t crcValue = HAL_CRC_Calculate(&hcrc, (uint32_t *)txBuffer, length / 4);
+    txBuffer[CRC_POS]     = (uint8_t)(crcValue & 0xFF);          // CRC LSB
+    txBuffer[CRC_POS + 1] = (uint8_t)((crcValue >> 8) & 0xFF);  // CRC MSB
 }
 
-// DMA transmit complete callback
+// USART1 DMA transmit complete — release transmitFrame() polling loop
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
-	if(huart->Instance == USART1) {
-		txNotComplete = 0;
-	}
+    if (huart->Instance == USART1) {
+        txNotComplete = 0;
+    }
 }
 
-// DMA receive complete callback
+// USART DMA receive complete callback
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-	// Main board
-	if(huart->Instance == USART1) {
-		uint8_t devRxBuffer[DEV_RX_LEN];
-		//Determine how many items of data have been received
-		uint8_t data_length = DEV_RX_LEN - __HAL_DMA_GET_COUNTER(huart1.hdmarx);//DMA1_Stream0->NDTR;
-		//Stop DMA	
-		HAL_UART_DMAStop(&huart1);
-		// Shortest messege is <C>
-		if(data_length > 2) {
-			if((devRxBuffer[START_POS] == START_MARKER) && (devRxBuffer[END_POS] == END_MARKER)) {
-				crtCmd = devRxBuffer[CMD_POS];
-			}
-		}
-		HAL_UART_Receive_DMA(&huart1, (uint8_t *)devRxBuffer, DEV_RX_LEN);
-		__HAL_DMA_DISABLE_IT(&hdma_usart1_rx, DMA_IT_HT);
-		__HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+    if (huart->Instance == USART1) {
+        // Static: DMA writes into this buffer after the callback returns —
+        // a local (stack) variable would be freed before DMA finishes
+        static uint8_t devRxBuffer[TX_SHORT_SIZE];
+        uint8_t data_length = TX_SHORT_SIZE - __HAL_DMA_GET_COUNTER(huart1.hdmarx);
+        HAL_UART_DMAStop(&huart1);
 
-	}
-	// GPS
-	if(huart->Instance == USART3) {
-		//Determine how many items of data have been received
-		uint8_t data_length = RX_BUFFER_LEN - __HAL_DMA_GET_COUNTER(huart3.hdmarx);//DMA1_Stream0->NDTR;
-		//Stop DMA	
-		HAL_UART_DMAStop(&huart3);
-		if(data_length > 99){
-			processGPS();
-		}
-		//memset(gpsRxBuffer, 0, RX_BUFFER_LEN);
-		HAL_UART_Receive_DMA(&huart3,  (uint8_t *)gpsRxBuffer, RX_BUFFER_LEN);
-		__HAL_DMA_DISABLE_IT(&hdma_usart3_rx, DMA_IT_HT);
-		__HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
+        if (data_length > 4) {
+            // TODO: parse command from devRxBuffer
+        }
 
-	}
+        HAL_UART_Receive_DMA(&huart1, devRxBuffer, TX_SHORT_SIZE);
+        __HAL_DMA_DISABLE_IT(&hdma_usart1_rx, DMA_IT_HT);
+        __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+    }
+
+    if (huart->Instance == USART3) {
+        // DMA TC fires when all RX_BUFFER_LEN=100 bytes are received —
+        // one exact UBX-NAV-PVT packet. Re-arm DMA immediately so the next
+        // packet starts filling gpsData[] without a gap. No memset needed;
+        // DMA overwrites all 100 bytes each transfer.
+        __HAL_UART_SEND_REQ(&huart3, UART_RXDATA_FLUSH_REQUEST);
+        HAL_UART_Receive_DMA(&huart3, gpsData, RX_BUFFER_LEN);
+        __HAL_DMA_DISABLE_IT(&hdma_usart3_rx, DMA_IT_HT);
+
+        // Sync-byte guard: reject mis-aligned transfers that can occur on the
+        // very first packet after startup if the module was mid-sentence
+        if (gpsData[0] == 0xB5) {
+            newGpsData = 1;
+        }
+    }
 }
 
-// Transmit data from sensor to main board on USART1
-void transmitData(const uint8_t *array, const uint8_t length) {
-	uint32_t startTime = HAL_GetTick();
-	txNotComplete = 1; // Assume transmission is not complete
-	HAL_UART_Transmit_DMA(&huart1, (uint8_t *)array, length);
-	while(txNotComplete) {
-		// Check for timeout
-		if (HAL_GetTick() - startTime > TIMEOUT_SEND) {
-			// Timeout occurred, abort transmission
-			HAL_UART_AbortTransmit(&huart1);
-			// Re-initialize UART
-			MX_USART1_UART_Init(); 
-			txNotComplete = 0; // Clear the transmission flag to exit the loop
-			break; // Exit the loop
-		}
-	}
+// Transmit txBuffer over USART1 DMA and block until complete or timeout
+void transmitFrame(const uint8_t length) {
+    uint32_t startTime = HAL_GetTick();
+    txNotComplete = 1;
+
+    HAL_UART_Transmit_DMA(&huart1, txBuffer, length);
+
+    while (txNotComplete) {
+        if (HAL_GetTick() - startTime > TIMEOUT_COMM) {
+            HAL_UART_AbortTransmit(&huart1);  // Abort on timeout
+            MX_USART1_UART_Init();            // Re-initialize UART
+            txNotComplete = 0;
+            break;
+        }
+    }
 }
 
-// Fill the USART 1 Tx buffer with data for sending
-void sendData() {
-	myGpsData.newData = 0;
-	uint8_t txBuffer[DEV_TX_LEN];
-	// Add Start marker and data response
-	txBuffer[START_POS] = START_MARKER;
-	txBuffer[CMD_POS] = RESPONSE_DATA;
-	// Add BMP581 data 2x float 8 bytes
-	*(BMP581_sensor_data_t *)&txBuffer[BMP_POS] = BMP581_Data;
-	// Add BNO data 5x float = 20 bytes
-	*(BNO_RotationVectorWAcc_t *)&txBuffer[BNO_POS] = sensorData.SenVal.RotationVector;
-	// Add GPS data 25 bytes, first byte is not used
-	*(GPS_DATA_t *)&txBuffer[GPS_POS] = myGpsData;
-	//txBuffer[56] is checkSum
-	generateChecksum(txBuffer, SUM_POS);
-	txBuffer[SUM_POS] = END_MARKER;
-	transmitData(txBuffer, DEV_TX_LEN);
+// Build and transmit the full sensor data frame over USART1
+void sendData(void) {
+    // Snapshot GPS data atomically — USART3 DMA ISR can write myGpsData at any
+    // point; preemption mid struct-copy yields torn data
+    __disable_irq();
+    GPS_DATA_t gpsSnapshot = myGpsData;
+    __enable_irq();
+
+    txBuffer[COUNT_POS] = LONG_DATA;
+    txBuffer[CMD_POS]   = RESPONSE_DATA;
+
+    // Average temperature — include HDC sensors only if they have been read
+    float avgTemp     = BMP581_Data.temperature;
+    uint8_t tempCount = 1;
+    if (temp1 != 0.0f) { avgTemp += temp1; tempCount++; }
+    if (temp2 != 0.0f) { avgTemp += temp2; tempCount++; }
+    avgTemp /= (float)tempCount;
+
+    // Use memcpy to write multi-byte values into the uint8_t buffer —
+    // direct float* casts violate strict aliasing under ARMCC V6
+    memcpy(&txBuffer[TEMP_POS],     &avgTemp,               sizeof(float));
+    memcpy(&txBuffer[PRESSURE_POS], &BMP581_Data.pressure,  sizeof(float));
+
+    float avgRH = (rh1 + rh2) / 2.0f;
+    memcpy(&txBuffer[RH_POS],  &avgRH,       sizeof(float));
+    memcpy(&txBuffer[BNO_POS], &rpy,          sizeof(BNO_RollPitchYaw_t));
+    memcpy(&txBuffer[GPS_POS], &gpsSnapshot,  sizeof(GPS_DATA_t));
+
+    calculateAndAppendCRC(CRC_POS);
+    txBuffer[END_POS] = END_MARKER;
+    transmitFrame(TX_LONG_SIZE);
 }
 
-// Send a messages to Main board on USART1
-void sendMessage(const uint8_t msgType) {
-	uint8_t txBuffer[DEV_RX_LEN] = {START_MARKER, msgType, END_MARKER};
-	transmitData(txBuffer, DEV_RX_LEN);
+// Build and transmit a short status/response message over USART1
+void sendMessage(uint8_t msgType) {
+    txBuffer[COUNT_POS] = SHORT_DATA;
+    txBuffer[CMD_POS]   = msgType;
+    calculateAndAppendCRC(CRC_POS_S);
+    txBuffer[END_POS_S] = END_MARKER;
+    transmitFrame(TX_SHORT_SIZE);
 }
+
 /* USER CODE END 0 */
 
 /**
@@ -201,102 +240,167 @@ void sendMessage(const uint8_t msgType) {
   */
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
+    /* USER CODE BEGIN 1 */
 
-  /* USER CODE END 1 */
+    /* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
+    /* MCU Configuration -------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+    /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+    HAL_Init();
 
-  /* USER CODE BEGIN Init */
+    /* USER CODE BEGIN Init */
 
-  /* USER CODE END Init */
+    /* USER CODE END Init */
 
-  /* Configure the system clock */
-  SystemClock_Config();
+    /* Configure the system clock */
+    SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
+    /* USER CODE BEGIN SysInit */
 
-  /* USER CODE END SysInit */
+    /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_SPI1_Init();
-  MX_USART1_UART_Init();
-  MX_USART3_UART_Init();
-  MX_I2C1_Init();
-  MX_TIM2_Init();
-  /* USER CODE BEGIN 2 */
-	
-	// Set up pins for BNO 
-	BNO_RST_On;
-	BNO_BOOT_On; // Off only for DFU mode 0x52 I2C Address
-	// Unselect M95512 EEPROM
-	EEPROM_RELEASE;
-	// Start GPS
-	M9N_Start();
+    /* Initialize all configured peripherals */
+    MX_GPIO_Init();
+    MX_DMA_Init();
+    MX_SPI1_Init();
+    MX_USART1_UART_Init();
+    MX_USART3_UART_Init();
+    MX_I2C1_Init();
+    MX_TIM2_Init();
+    MX_CRC_Init();
 
-	// Init and start BMP581
-	if((BMP581_Init() == HAL_OK) && (BMP581_setHighAccuracy() == HAL_OK)) {
-		sendMessage(RESPONSE_BMP_INIT_OK);
-	} else {
-		sendMessage(RESPONSE_BMP_INIT_FAIL);
-	}
-	
-	// Init and start BNO086
-	if(BNO_Init() == HAL_OK) {
-		sendMessage(RESPONSE_BNO_INIT_OK);
-	} else {
-		sendMessage(RESPONSE_BNO_INIT_FAIL);
-	}
-	
-  /* USER CODE END 2 */
+    /* USER CODE BEGIN 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-		// If GPS has new data
-		if(myGpsData.newData) {
-			sendData();
-		}
-		// If we have a command
-		if(crtCmd == CMD_CALIBRATE) {
-			crtCmd = 0;	
-			if(BNO_calibrateHighAccuracyAndReset() == HAL_OK){
-				sendMessage(RESPONSE_CALIBRATE_OK);
-			} else {
-				sendMessage(RESPONSE_CALIBRATE_FAIL);
-			}
-		}
-		// If BMP581 triggers interrup, check for new data
-		if(BMP_Ready) {
-			BMP_Ready = 0;
-			BMP581_getSensorData(&BMP581_Data);
-			// if(BMP581_getSensorData(&BMP581_Data) == HAL_OK) {			}
-		}
-		// If BNO086 triggers interrup, check for new data
-		if(BNO_Ready) {
-			// Did we have a reset? SetUp sensor again
-			if(isResetOccurred()) {
-				if(BNO_setFeature(ROTATION_VECTOR, 100000, 0) != HAL_OK) {
-					//printf("Reset Occurred. Set feature failed\r\n");
-				}
-			}
-			// If we have new data from BNO
-			if((BNO_dataAvailable() == HAL_OK) && (sensorData.sensorId == ROTATION_VECTOR)) {
-				sensorData.sensorId = 0;
-				//printf("Y = %.3lf P = %.3lf R = %.3lf | %d \r\n", rpy.Yaw, rpy.Pitch, rpy.Roll, HAL_GetTick() - BNO_Time);
-			}
-		}
-    /* USER CODE END WHILE */
+    M9N_Reset();
+    HDC302x_Reset();
 
-    /* USER CODE BEGIN 3 */
+    // Configure BNO086 boot pins — BOOT_On = normal operation (low = DFU mode, 0x52 I2C address)
+    BNO_RST_On;
+    BNO_BOOT_On;
+
+    // Wait for all sensors to complete power-on sequence
+    HAL_Delay(1000);
+
+    // Set fixed frame header bytes
+    txBuffer[0] = START_MARKER;
+    txBuffer[1] = START_MARKER;
+
+    // Deselect M95512 EEPROM (CS idle-high)
+    EEPROM_RELEASE;
+
+    // Start GPS DMA reception
+    M9N_Start();
+
+    // Initialize HDC302x Sensor 2
+    Sensor2.Address = HDC302X_SENSOR_2_ADDR;
+    if (HDC302x_Init(&Sensor2) != HAL_OK) {
+        printf("Sensor 2 initialization failed!\n");
+    } else {
+        printf("Sensor 2 initialized successfully.\n");
+    }
+
+    // Initialize HDC302x Sensor 1
+    Sensor1.Address = HDC302X_SENSOR_1_ADDR;
+    if (HDC302x_Init(&Sensor1) != HAL_OK) {
+        printf("Sensor 1 initialization failed!\n");
+    } else {
+        printf("Sensor 1 initialized successfully.\n");
+    }
+
+    // Start HDC302x auto-measurement at 4 Hz LPM0 — sensor measures continuously;
+    // HDC302x_ReadData() fetches the latest result from the output register
+    HDC302x_StartAutoMeasurement(&Sensor1, HDC302X_CMD_AUTO_MEASUREMENT_4_PER_SECOND_LPM0);
+    HDC302x_StartAutoMeasurement(&Sensor2, HDC302X_CMD_AUTO_MEASUREMENT_4_PER_SECOND_LPM0);
+    readTime = HAL_GetTick();
+
+    // Initialize BMP581
+    if (BMP581_Init() == HAL_OK) {
+        sendMessage(RESPONSE_BMP_INIT_OK);
+    } else {
+        sendMessage(RESPONSE_BMP_INIT_FAIL);
+        printf("BMP initialization failed!\n");
+    }
+
+	// Initialize BNO086 (currently disabled)
+  if (BNO_Init() == HAL_OK) {
+      if (BNO_setHighAccuracyMode() != HAL_OK) {
+          // Sensor alive but rpy will stay zero
+          sendMessage(RESPONSE_BNO_INIT_FAIL);
+          printf("BNO high accuracy mode failed!\n");
+      } else {
+          sendMessage(RESPONSE_BNO_INIT_OK);
+      }
+  } else {
+      sendMessage(RESPONSE_BNO_INIT_FAIL);
+      printf("BNO initialization failed!\n");
   }
-  /* USER CODE END 3 */
+
+	HAL_Delay(TIMEOUT_COMM);
+
+    /* USER CODE END 2 */
+
+    /* Infinite loop */
+    /* USER CODE BEGIN WHILE */
+    while (1)
+    {
+        // Handle calibration command from main controller
+        if (crtCmd == CMD_CALIBRATE) {
+            crtCmd = 0;
+            if (BNO_calibrateHighAccuracyAndReset() == HAL_OK) {
+                sendMessage(RESPONSE_CALIBRATE_OK);
+            } else {
+                sendMessage(RESPONSE_CALIBRATE_FAIL);
+            }
+        }
+
+      // BNO086 — update rpy (5 Hz, interrupt-driven)
+      // NOTE: do NOT clear BNO_Ready here. waitInt() inside BNO_dataAvailable()
+      // finds BNO_Ready set and clears it itself. Clearing it here first causes
+      // waitInt() to always time out → rpy never updates.
+      // NOTE: isResetOccurred() reads a flag set by processResponse() inside
+      if (BNO_Ready) {
+          BNO_dataAvailable();    // waitInt() clears BNO_Ready; quaternionUpdate() updates rpy
+          if (isResetOccurred()) {
+              BNO_setFeature(ROTATION_VECTOR, 200000, 0);
+          }
+      }
+
+      // BMP581 — update pressure and temperature (4 Hz, interrupt-driven)
+      if (BMP_Ready) {
+				BMP_Ready = 0;
+				BMP581_Get_TempPressData(&BMP581_Data);
+      }
+
+      // HDC302x — read humidity and temperature at 4 Hz (HDC_READ_TIME = 250 ms)
+      // Auto-measurement runs continuously inside the sensor; ReadData() fetches
+      // the latest result from the output register
+      if ((HAL_GetTick() - readTime) > HDC_READ_TIME) {
+				if (HDC302x_ReadData(&Sensor1) == HAL_OK) {
+					temp1 = Sensor1.Data.Temperature;
+					rh1   = Sensor1.Data.Humidity;
+				}
+				if (HDC302x_ReadData(&Sensor2) == HAL_OK) {
+					temp2 = Sensor2.Data.Temperature;
+					rh2   = Sensor2.Data.Humidity;
+				}
+				readTime = HAL_GetTick();
+      }
+
+      // GPS — process and transmit at 4 Hz (driven by GPS nav rate)
+      // Clear flag before processGPS() so a GPS interrupt arriving during
+      // sendData() is not lost
+      if (newGpsData) {
+				newGpsData = 0;
+				processGPS();
+				sendData();
+      }
+
+        /* USER CODE END WHILE */
+
+        /* USER CODE BEGIN 3 */
+    }
+    /* USER CODE END 3 */
 }
 
 /**
@@ -305,48 +409,47 @@ int main(void)
   */
 void SystemClock_Config(void)
 {
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+    RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
+    /** Initializes the RCC Oscillators according to the specified parameters
+      * in the RCC_OscInitTypeDef structure.
+      */
+    RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI | RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState            = RCC_HSE_ON;
+    RCC_OscInitStruct.HSEPredivValue      = RCC_HSE_PREDIV_DIV1;
+    RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLMUL          = RCC_PLL_MUL9;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+    /** Initializes the CPU, AHB and APB bus clocks. */
+    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                     | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+    {
+        Error_Handler();
+    }
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1|RCC_PERIPHCLK_USART3
-                              |RCC_PERIPHCLK_I2C1;
-  PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK2;
-  PeriphClkInit.Usart3ClockSelection = RCC_USART3CLKSOURCE_PCLK1;
-  PeriphClkInit.I2c1ClockSelection = RCC_I2C1CLKSOURCE_HSI;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
-  {
-    Error_Handler();
-  }
+    PeriphClkInit.PeriphClockSelection  = RCC_PERIPHCLK_USART1 | RCC_PERIPHCLK_USART3
+                                        | RCC_PERIPHCLK_I2C1;
+    PeriphClkInit.Usart1ClockSelection  = RCC_USART1CLKSOURCE_PCLK2;
+    PeriphClkInit.Usart3ClockSelection  = RCC_USART3CLKSOURCE_PCLK1;
+    PeriphClkInit.I2c1ClockSelection    = RCC_I2C1CLKSOURCE_HSI;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+    {
+        Error_Handler();
+    }
 }
 
 /* USER CODE BEGIN 4 */
@@ -359,28 +462,24 @@ void SystemClock_Config(void)
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
+    /* USER CODE BEGIN Error_Handler_Debug */
+    __disable_irq();
+    while (1)
+    {
+    }
+    /* USER CODE END Error_Handler_Debug */
 }
 
-#ifdef  USE_FULL_ASSERT
+#ifdef USE_FULL_ASSERT
 /**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
+  * @brief  Reports the source file and line number where assert_param failed.
   * @param  file: pointer to the source file name
   * @param  line: assert_param error line source number
   * @retval None
   */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
+    /* USER CODE BEGIN 6 */
+    /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
